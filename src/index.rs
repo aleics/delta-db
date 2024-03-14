@@ -1,12 +1,15 @@
-use crate::query::{FilterOperation, FilterResult, SortDirection};
-use crate::{DataItemId, FieldValue};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
+
 use indexmap::IndexSet;
 use ordered_float::OrderedFloat;
 use roaring::{MultiOps, RoaringBitmap};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Bound;
+use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Iso8601;
 use time::Date;
+
+use crate::query::{FilterOperation, FilterResult, SortDirection};
+use crate::{DataItemId, FieldValue};
 
 pub trait Indexable {
     fn id(&self) -> DataItemId;
@@ -107,7 +110,7 @@ trait FilterableIndex {
     ) -> Option<RoaringBitmap>;
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum Index {
     String(StringIndex),
     Numeric(NumericIndex),
@@ -182,7 +185,7 @@ impl Index {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct StringIndex {
     inner: SortableIndex<String>,
 }
@@ -231,7 +234,7 @@ impl FilterableIndex for StringIndex {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct NumericIndex {
     inner: SortableIndex<OrderedFloat<f64>>,
 }
@@ -305,7 +308,7 @@ impl FilterableIndex for NumericIndex {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct DateIndex {
     inner: SortableIndex<i64>,
 }
@@ -371,7 +374,7 @@ impl FilterableIndex for DateIndex {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct EnumIndex {
     values: IndexSet<String>,
     inner: SortableIndex<usize>,
@@ -439,7 +442,7 @@ impl FilterableIndex for EnumIndex {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct SortableIndex<T: Ord>(BTreeMap<T, RoaringBitmap>);
 
 impl<T: Ord> SortableIndex<T> {

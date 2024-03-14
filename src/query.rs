@@ -1,7 +1,11 @@
-use crate::index::{Index, Indexable};
-use crate::{DataItemId, EntityIndices, EntityStorage, FieldValue};
-use roaring::RoaringBitmap;
 use std::collections::HashMap;
+
+use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
+
+use crate::index::{Index, Indexable};
+use crate::storage::{EntityIndices, EntityStorage};
+use crate::{DataItemId, FieldValue};
 
 #[derive(Debug, PartialEq)]
 pub struct FilterOption {
@@ -15,13 +19,13 @@ impl FilterOption {
     }
 }
 
-struct QueryIndices<'a> {
-    stored: &'a EntityIndices,
+struct QueryIndices {
+    stored: EntityIndices,
     deltas: HashMap<String, Index>,
 }
 
-impl<'a> QueryIndices<'a> {
-    fn new(stored: &'a EntityIndices) -> Self {
+impl QueryIndices {
+    fn new(stored: EntityIndices) -> Self {
         QueryIndices {
             stored,
             deltas: HashMap::new(),
@@ -30,7 +34,7 @@ impl<'a> QueryIndices<'a> {
 
     fn attach_deltas<T>(mut self, deltas: &[BoxedDelta<T>], storage: &EntityStorage<T>) -> Self
     where
-        T: Indexable,
+        T: Indexable + Serialize,
     {
         for delta in deltas {
             let change = delta.change();
@@ -47,11 +51,11 @@ impl<'a> QueryIndices<'a> {
             if let Some(delta_index) = self.deltas.get_mut(&change.scope.field_name) {
                 if let Some(position) = storage.get_position_by_id(&change.scope.id) {
                     if let Some(before) = change.before.as_ref() {
-                        delta_index.remove(before, *position);
+                        delta_index.remove(before, position);
                     }
 
                     if let Some(after) = change.after {
-                        delta_index.put(after, *position);
+                        delta_index.put(after, position);
                     }
                 }
             }
@@ -123,15 +127,20 @@ impl<'a> QueryIndices<'a> {
 pub struct OptionsQueryExecution<T> {
     filter: Option<CompositeFilter>,
     deltas: Vec<BoxedDelta<T>>,
+    ref_fields: Option<Vec<String>>,
 }
 
-impl<T: Indexable> OptionsQueryExecution<T> {
+impl<T: Indexable + Serialize> OptionsQueryExecution<T> {
     pub fn new() -> Self {
         OptionsQueryExecution::default()
     }
 
     pub fn with_filter(mut self, filter: CompositeFilter) -> Self {
+        if let Some(ref_fields) = self.ref_fields.as_mut() {
+            ref_fields.append(&mut filter.get_referenced_fields());
+        }
         self.filter = Some(filter);
+
         self
     }
 
@@ -146,7 +155,14 @@ impl<T: Indexable> OptionsQueryExecution<T> {
     }
 
     pub fn run(self, storage: &EntityStorage<T>) -> Vec<FilterOption> {
-        let indices = QueryIndices::new(&storage.indices).attach_deltas(&self.deltas, storage);
+        // Read the indices from storage. In case no fields are referenced, use all indices
+        // as filter options.
+        let indices = match self.ref_fields {
+            Some(fields) => storage.read_indices(fields.as_slice()),
+            None => storage.read_all_indices(),
+        };
+
+        let indices = QueryIndices::new(indices).attach_deltas(&self.deltas, storage);
 
         let filter_result = self
             .filter
@@ -163,6 +179,7 @@ impl<T> Default for OptionsQueryExecution<T> {
         OptionsQueryExecution {
             filter: None,
             deltas: Vec::new(),
+            ref_fields: None,
         }
     }
 }
@@ -172,14 +189,16 @@ pub struct QueryExecution<T> {
     deltas: Vec<BoxedDelta<T>>,
     sort: Option<Sort>,
     pagination: Option<Pagination>,
+    ref_fields: Vec<String>,
 }
 
-impl<T: Indexable + Clone> QueryExecution<T> {
+impl<T: Indexable + Clone + Serialize + for<'a> Deserialize<'a>> QueryExecution<T> {
     pub fn new() -> Self {
         QueryExecution::default()
     }
 
     pub fn with_filter(mut self, filter: CompositeFilter) -> Self {
+        self.ref_fields.append(&mut filter.get_referenced_fields());
         self.filter = Some(filter);
         self
     }
@@ -195,6 +214,7 @@ impl<T: Indexable + Clone> QueryExecution<T> {
     }
 
     pub fn with_sort(mut self, sort: Sort) -> Self {
+        self.ref_fields.append(&mut sort.get_referenced_fields());
         self.sort = Some(sort);
         self
     }
@@ -205,7 +225,8 @@ impl<T: Indexable + Clone> QueryExecution<T> {
     }
 
     pub fn run(self, storage: &EntityStorage<T>) -> Vec<T> {
-        let indices = QueryIndices::new(&storage.indices).attach_deltas(&self.deltas, storage);
+        let indices = QueryIndices::new(storage.read_indices(&self.ref_fields))
+            .attach_deltas(&self.deltas, storage);
 
         let filter_result = self
             .filter
@@ -229,7 +250,6 @@ impl<T: Indexable + Clone> QueryExecution<T> {
                 .execute_sort(&filter_result.hits, sort)
                 .iter()
                 .flat_map(|position| storage.get_id_by_position(position))
-                .copied()
                 .collect();
         }
 
@@ -237,7 +257,6 @@ impl<T: Indexable + Clone> QueryExecution<T> {
             .hits
             .iter()
             .flat_map(|position| storage.get_id_by_position(&position))
-            .copied()
             .collect()
     }
 
@@ -254,7 +273,7 @@ impl<T: Indexable + Clone> QueryExecution<T> {
         let pagination = self.pagination.unwrap_or(Pagination::new(0, ids.len()));
 
         for id in ids.iter().skip(pagination.start).take(pagination.size) {
-            if let Some(mut item) = storage.data.get(id).cloned() {
+            if let Some(mut item) = storage.read(id) {
                 if let Some(deltas) = deltas_by_id.get(id) {
                     for delta in deltas {
                         delta.apply_data(&mut item);
@@ -276,6 +295,7 @@ impl<T: Indexable + Clone> Default for QueryExecution<T> {
             deltas: Vec::new(),
             sort: None,
             pagination: None,
+            ref_fields: Vec::new(),
         }
     }
 }
@@ -342,6 +362,17 @@ impl CompositeFilter {
     pub fn negate(filter: CompositeFilter) -> Self {
         CompositeFilter::Not(Box::new(filter))
     }
+
+    pub fn get_referenced_fields(&self) -> Vec<String> {
+        match self {
+            CompositeFilter::And(composite) | CompositeFilter::Or(composite) => composite
+                .iter()
+                .flat_map(|filter| filter.get_referenced_fields())
+                .collect(),
+            CompositeFilter::Not(filter) => filter.get_referenced_fields(),
+            CompositeFilter::Single(filter) => vec![filter.name.to_string()],
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -406,6 +437,10 @@ impl Sort {
     pub fn with_direction(mut self, direction: SortDirection) -> Self {
         self.direction = direction;
         self
+    }
+
+    fn get_referenced_fields(&self) -> Vec<String> {
+        vec![self.by.to_string()]
     }
 }
 
